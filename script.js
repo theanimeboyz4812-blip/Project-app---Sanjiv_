@@ -1,461 +1,302 @@
-// ============================================
-//  LIVE BACKEND CONFIGURATION (Render)
-// ============================================
-const BACKEND_URL = "https://smart-transit-guard-backend.onrender.com";
+/* ==========================================================================
+   SMART TRANSIT GUARD - COMPLETE APPLICATION SCRIPT
+   Features: Web Serial API, Leaflet Map, Turf.js Geofence, Google Auth,
+             Browser Notifications, and Simulation Controls.
+   ========================================================================== */
 
-// ============================================
-//  TAB NAVIGATION — Main / How It Works / Features / Team
-// ============================================
+// --------------------------------------------------------------------------
+// 1. GLOBAL CONFIGURATION & STATE
+// --------------------------------------------------------------------------
 
-const tabButtons   = document.querySelectorAll('.tab-btn');
-const tabIndicator = document.getElementById('tabIndicator');
-let activePanel     = document.querySelector('.tab-panel.active');
+// ⚠️ REPLACE THIS WITH YOUR GOOGLE CLIENT ID FROM GOOGLE CLOUD CONSOLE
+const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
 
-// Moves the sliding indicator bar to sit under the given tab button
-function moveIndicator(tabButton) {
-  if (!tabButton || !tabIndicator) return;
-  tabIndicator.style.width     = tabButton.offsetWidth + 'px';
-  tabIndicator.style.transform = `translateX(${tabButton.offsetLeft}px)`;
-}
+// Default Starting Center (Chennai, India)
+const DEFAULT_LAT = 13.0827;
+const DEFAULT_LNG = 80.2707;
 
-// Switches to a new tab by its data-tab value (e.g. "features")
-function switchTab(tabKey) {
-  const targetButton = document.querySelector(`.tab-btn[data-tab="${tabKey}"]`);
-  const targetPanel  = document.getElementById('panel-' + tabKey);
+// Geofence Boundary Coordinates (Turf.js Polygon format: [lng, lat])
+// Creates a safe box around the initial location
+const SAFE_ZONE_POLYGON = turf.polygon([[
+  [80.2600, 13.0900],
+  [80.2850, 13.0900],
+  [80.2850, 13.0750],
+  [80.2600, 13.0750],
+  [80.2600, 13.0900] // Closed ring (first and last point match)
+]]);
 
-  if (!targetButton || !targetPanel || targetPanel === activePanel) return;
+// Application State Variables
+let map, vehicleMarker, geofenceLayer;
+let serialPort = null;
+let serialWriter = null;
+let isCurrentBreach = false;
 
-  tabButtons.forEach(btn => btn.classList.remove('active'));
-  targetButton.classList.add('active');
-  moveIndicator(targetButton);
-
-  if (activePanel) {
-    activePanel.classList.remove('visible');
-  }
-
-  setTimeout(function () {
-    if (activePanel) {
-      activePanel.classList.remove('active');
-    }
-
-    targetPanel.classList.add('active');    
-    void targetPanel.offsetWidth;           
-    targetPanel.classList.add('visible');   
-
-    activePanel = targetPanel;
-
-    // Leaflet computes its size when the map div becomes visible again —
-    // without this, the map looks broken/grey after switching tabs away and back
-    if (tabKey === 'main' && typeof geofenceMap !== 'undefined' && geofenceMap) {
-      geofenceMap.invalidateSize();
-    }
-  }, 300);
-}
-
-tabButtons.forEach(function (btn) {
-  btn.addEventListener('click', function () {
-    switchTab(btn.dataset.tab);
-  });
+// --------------------------------------------------------------------------
+// 2. INITIALIZATION ON PAGE LOAD
+// --------------------------------------------------------------------------
+window.addEventListener("DOMContentLoaded", () => {
+  initMap();
+  initGoogleAuth();
+  requestNotificationPermission();
 });
 
-const seeHowBtn = document.getElementById('seeHowItWorksBtn');
-if (seeHowBtn) {
-  seeHowBtn.addEventListener('click', function () {
-    switchTab('how-it-works');
-  });
+// --------------------------------------------------------------------------
+// 3. LEAFLET MAP & TURF.JS GEOFENCE LOGIC
+// --------------------------------------------------------------------------
+function initMap() {
+  // Initialize Leaflet Map
+  map = L.map("map").setView([DEFAULT_LAT, DEFAULT_LNG], 14);
+
+  // Add OpenStreetMap Tile Layer
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "© OpenStreetMap contributors"
+  }).addTo(map);
+
+  // Render Geofence Boundary Polygon on Map (Green Box)
+  geofenceLayer = L.geoJSON(SAFE_ZONE_POLYGON, {
+    style: {
+      color: "#10b981",
+      weight: 2,
+      fillColor: "#10b981",
+      fillOpacity: 0.15
+    }
+  }).addTo(map);
+
+  // Create Vehicle Marker
+  vehicleMarker = L.marker([DEFAULT_LAT, DEFAULT_LNG]).addTo(map)
+    .bindPopup("<b>Smart Transit Guard</b><br>Vehicle Tracker")
+    .openPopup();
+
+  // Perform initial position check
+  updateVehiclePosition(DEFAULT_LAT, DEFAULT_LNG);
 }
 
-window.addEventListener('load', function () {
-  const activeBtn = document.querySelector('.tab-btn.active');
-  if (activeBtn) {
-    moveIndicator(activeBtn);
-  }
-});
+// Update Marker Position and Check Geofence
+function updateVehiclePosition(lat, lng) {
+  // 1. Move Marker & Pan Map Smoothly
+  const newLatLng = new L.LatLng(lat, lng);
+  vehicleMarker.setLatLng(newLatLng);
+  map.panTo(newLatLng);
 
-// ============================================
-//  HIDE HEADER ON SCROLL
-// ============================================
+  // 2. Update Coordinate Displays in DOM
+  const latEl = document.getElementById("latDisplay");
+  const lngEl = document.getElementById("lngDisplay");
+  if (latEl) latEl.innerText = lat.toFixed(6);
+  if (lngEl) lngEl.innerText = lng.toFixed(6);
 
-const headerEl = document.querySelector('header');
+  // 3. Turf.js Geofence Check (Note: Turf uses [lng, lat])
+  const currentPoint = turf.point([lng, lat]);
+  const isInside = turf.booleanPointInPolygon(currentPoint, SAFE_ZONE_POLYGON);
 
-window.addEventListener('scroll', function () {
-  if (!headerEl) return;
-  const scrolled      = window.scrollY;
-  const scrollableMax = document.documentElement.scrollHeight - window.innerHeight;
+  // 4. Update Status UI & Trigger Alerts
+  const statusBadge = document.getElementById("statusBadge");
+  const zoneDisplay = document.getElementById("zoneDisplay");
 
-  const scrollFraction = scrollableMax > 0 ? (scrolled / scrollableMax) : 0;
-
-  if (scrollFraction > 0.2) {
-    headerEl.classList.add('header-hidden');
+  if (isInside) {
+    if (statusBadge) {
+      statusBadge.className = "status-card status-safe";
+      statusBadge.innerText = "✅ VEHICLE SAFE";
+    }
+    if (zoneDisplay) zoneDisplay.innerText = "Inside Safe Zone";
+    
+    // Reset breach flag if vehicle returns to safe area
+    if (isCurrentBreach) {
+      isCurrentBreach = false;
+      sendSerialCommand("SAFE");
+    }
   } else {
-    headerEl.classList.remove('header-hidden');
-  }
-});
-
-// ============================================
-//  WEB NOTIFICATIONS
-// ============================================
-
-window.addEventListener('load', function () {
-  if ('Notification' in window) {
-    if (Notification.permission !== 'granted' && Notification.permission !== 'denied') {
-      Notification.requestPermission();
+    if (statusBadge) {
+      statusBadge.className = "status-card status-breach";
+      statusBadge.innerText = "🚨 GEOFENCE BREACH DETECTED";
     }
-  } else {
-    console.log('This browser does not support desktop notifications.');
+    if (zoneDisplay) zoneDisplay.innerText = "⚠️ OUTSIDE SAFE ZONE";
+
+    // Trigger Breach Alerts only on status transition to prevent spam
+    if (!isCurrentBreach) {
+      isCurrentBreach = true;
+      triggerAppNotification(lat, lng);
+      sendSerialCommand("BREACH"); // Tells ESP32 to trigger SMS via SIM800L
+    }
   }
-});
-
-function showBreachNotification() {
-  const popup = document.getElementById('fakeNotification');
-  if (!popup) return;
-
-  popup.classList.add('show');
-
-  clearTimeout(window.notifTimeout);
-  window.notifTimeout = setTimeout(function () {
-    popup.classList.remove('show');
-  }, 4000);
 }
 
-// ============================================
-//  LOCATION + TIMESTAMP READOUT
-// ============================================
+// --------------------------------------------------------------------------
+// 4. WEB SERIAL API INTEGRATION (ESP32 LIVE STREAM)
+// --------------------------------------------------------------------------
+async function connectESP32() {
+  if (!("serial" in navigator)) {
+    alert("Web Serial API is not supported in this browser. Please use Chrome or Edge.");
+    return;
+  }
 
-const SAFE_ZONE_CENTER_LAT = 13.0827;
-const SAFE_ZONE_CENTER_LNG = 80.2707;
+  try {
+    // Prompt user to select ESP32 COM Port
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 115200 });
 
-const coordValueEl     = document.getElementById('coordValue');
-const timeValueEl      = document.getElementById('timeValue');
-const popupCoordTimeEl = document.getElementById('popupCoordTime');
+    // Set up Writable Stream for sending commands to ESP32
+    const textEncoder = new TextEncoderStream();
+    textEncoder.readable.pipeTo(serialPort.writable);
+    serialWriter = textEncoder.writable.getWriter();
 
-function formatTime(date) {
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    // Update UI Button status
+    const connectBtn = document.getElementById("connectBtn");
+    if (connectBtn) {
+      connectBtn.innerText = "⚡ ESP32 Connected";
+      connectBtn.style.backgroundColor = "#10b981";
+    }
+
+    // Set up Readable Stream to process incoming ESP32 JSON data
+    const textDecoder = new TextDecoderStream();
+    serialPort.readable.pipeTo(textDecoder.writable);
+    const reader = textDecoder.readable.getReader();
+
+    let stringBuffer = "";
+
+    // Read stream continuously
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      if (value) {
+        stringBuffer += value;
+        // Split buffered string by newline characters
+        let lines = stringBuffer.split("\n");
+        // Keep unfinished last line in buffer
+        stringBuffer = lines.pop();
+
+        for (let line of lines) {
+          line = line.trim();
+          if (line.startsWith("{") && line.endsWith("}")) {
+            try {
+              const telemetry = JSON.parse(line);
+              if (telemetry.lat && telemetry.lng) {
+                updateVehiclePosition(telemetry.lat, telemetry.lng);
+              }
+            } catch (err) {
+              console.warn("Partial JSON chunk skipped:", line);
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Serial connection error:", err);
+    alert("Failed to connect to ESP32: " + err.message);
+  }
 }
 
-function clearBreachReadout() {
-  if (coordValueEl) coordValueEl.textContent = '— , —';
-  if (timeValueEl) timeValueEl.textContent = '--:--:--';
-  if (popupCoordTimeEl) popupCoordTimeEl.textContent = '';
+// Send ASCII command string to ESP32 over Web Serial
+async function sendSerialCommand(command) {
+  if (serialWriter) {
+    try {
+      await serialWriter.write(command + "\n");
+      console.log(`Sent command to ESP32: ${command}`);
+    } catch (err) {
+      console.error("Failed to write to Serial port:", err);
+    }
+  }
 }
 
-// Fills the readout boxes + popup using a REAL lat/lng pair
-// (used by both the simulate button and the live feed)
-function showReadoutFromPoint(lat, lng) {
-  const now = new Date();
-  const timeStr = formatTime(now);
-  const latStr = lat.toFixed(6);
-  const lngStr = lng.toFixed(6);
-
-  if (coordValueEl) coordValueEl.textContent = `${latStr}, ${lngStr}`;
-  if (timeValueEl) timeValueEl.textContent = timeStr;
-  if (popupCoordTimeEl) popupCoordTimeEl.textContent = `📍 ${latStr}, ${lngStr}  •  🕒 ${timeStr}`;
+// --------------------------------------------------------------------------
+// 5. BROWSER NOTIFICATION SYSTEM
+// --------------------------------------------------------------------------
+function requestNotificationPermission() {
+  if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+    Notification.requestPermission();
+  }
 }
 
-// ============================================
-//  GEOFENCE MAP (Leaflet + Leaflet.draw + Turf.js)
-//  Draw a polygon on the map (or drag its corners) to set a
-//  custom safe zone. Every position update — simulated or live —
-//  is checked against whatever polygon currently exists here,
-//  using turf.booleanPointInPolygon for the real breach result.
-// ============================================
+function triggerAppNotification(lat, lng) {
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification("🚨 SMART TRANSIT GUARD ALERT!", {
+      body: `Geofence Breach Detected at Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}!`,
+      icon: "https://cdn-icons-png.flaticon.com/512/564/564619.png",
+      requireInteraction: true
+    });
+  }
+}
 
-let geofenceMap      = null;  // the Leaflet map instance
-let trackerMarker    = null;  // the dot showing the tracker's current position
-let drawnItems        = null;  // the layer group holding the current geofence shape
-let geofencePolygon   = null;  // the current geofence, as GeoJSON (what Turf reads)
+// --------------------------------------------------------------------------
+// 6. GOOGLE AUTHENTICATION SYSTEM
+// --------------------------------------------------------------------------
+function initGoogleAuth() {
+  if (typeof google !== "undefined" && google.accounts) {
+    google.accounts.id.initialize({
+      client_id: GOOGLE_CLIENT_ID,
+      callback: handleCredentialResponse
+    });
 
-function initGeofenceMap() {
-  const mapEl = document.getElementById('geofenceMap');
-  if (!mapEl || typeof L === 'undefined' || typeof turf === 'undefined') return;
+    const googleBtnContainer = document.getElementById("googleBtn");
+    if (googleBtnContainer) {
+      google.accounts.id.renderButton(googleBtnContainer, {
+        theme: "outline",
+        size: "medium",
+        shape: "pill"
+      });
+    }
+  }
+  checkExistingSession();
+}
 
-  geofenceMap = L.map('geofenceMap').setView([SAFE_ZONE_CENTER_LAT, SAFE_ZONE_CENTER_LNG], 16);
+function handleCredentialResponse(response) {
+  const payload = parseJwt(response.credential);
+  const userName = payload.name;
+  const userPicture = payload.picture;
 
-  // Dark map tiles so it matches the site's dark theme
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; OpenStreetMap, &copy; CARTO',
-    maxZoom: 20
-  }).addTo(geofenceMap);
+  document.getElementById("userName").innerText = userName;
+  document.getElementById("userAvatar").src = userPicture;
 
-  // This group holds whichever geofence shape currently exists —
-  // Leaflet.draw's edit/delete tools only work on layers inside it
-  drawnItems = new L.FeatureGroup();
-  geofenceMap.addLayer(drawnItems);
+  document.getElementById("googleBtn").classList.add("hidden");
+  document.getElementById("userProfile").classList.remove("hidden");
 
-  // Give the map a default circular safe zone (~150m) so there's always
-  // something valid to check breaches against, even before you draw your own
-  const defaultCircle = turf.circle(
-    [SAFE_ZONE_CENTER_LNG, SAFE_ZONE_CENTER_LAT], // Turf uses [lng, lat] order
-    0.15,
-    { steps: 32, units: 'kilometers' }
+  localStorage.setItem("userLoggedIn", "true");
+  localStorage.setItem("userName", userName);
+  localStorage.setItem("userAvatar", userPicture);
+}
+
+function parseJwt(token) {
+  const base64Url = token.split(".")[1];
+  const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+  const jsonPayload = decodeURIComponent(
+    window.atob(base64)
+      .split("")
+      .map(c => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+      .join("")
   );
-  drawnItems.addLayer(L.geoJSON(defaultCircle).getLayers()[0]);
-  geofencePolygon = defaultCircle;
-
-  // The dot that represents the tracker's live position
-  trackerMarker = L.circleMarker([SAFE_ZONE_CENTER_LAT, SAFE_ZONE_CENTER_LNG], {
-    radius: 8,
-    color: '#3ddc84',
-    fillColor: '#3ddc84',
-    fillOpacity: 1,
-    weight: 2
-  }).addTo(geofenceMap);
-
-  // Drawing toolbar — only polygon drawing + editing/deleting are enabled
-  const drawControl = new L.Control.Draw({
-    edit: { featureGroup: drawnItems },
-    draw: {
-      polygon: { shapeOptions: { color: '#ff0033' } },
-      marker: false,
-      circle: false,
-      circlemarker: false,
-      polyline: false,
-      rectangle: false
-    }
-  });
-  geofenceMap.addControl(drawControl);
-
-  // Drawing a NEW polygon replaces whatever geofence existed before
-  // (keeps things simple — only one active safe zone at a time)
-  geofenceMap.on(L.Draw.Event.CREATED, function (e) {
-    drawnItems.clearLayers();
-    drawnItems.addLayer(e.layer);
-    geofencePolygon = e.layer.toGeoJSON();
-  });
-
-  // Dragging the polygon's corners updates the geofence Turf checks against
-  geofenceMap.on(L.Draw.Event.EDITED, function (e) {
-    e.layers.eachLayer(function (layer) {
-      geofencePolygon = layer.toGeoJSON();
-    });
-  });
-
-  // Deleting the polygon falls back to the default circle again
-  geofenceMap.on(L.Draw.Event.DELETED, function () {
-    if (drawnItems.getLayers().length === 0) {
-      drawnItems.addLayer(L.geoJSON(defaultCircle).getLayers()[0]);
-      geofencePolygon = defaultCircle;
-    }
-  });
+  return JSON.parse(jsonPayload);
 }
 
-// THE REAL BREACH CHECK — is this lat/lng inside the current geofence?
-function isPointInsideGeofence(lat, lng) {
-  if (!geofencePolygon) return true; // nothing drawn yet — assume safe
-  const point = turf.point([lng, lat]); // Turf wants [lng, lat], not [lat, lng]
-  return turf.booleanPointInPolygon(point, geofencePolygon);
+function handleSignOut() {
+  localStorage.clear();
+  document.getElementById("googleBtn").classList.remove("hidden");
+  document.getElementById("userProfile").classList.add("hidden");
 }
 
-// Moves the tracker dot to a new position on the map, and colors it
-// green (safe) or red (breached) to match the rest of the dashboard
-function updateTrackerMarker(lat, lng, breached) {
-  if (!trackerMarker) return;
-  trackerMarker.setLatLng([lat, lng]);
-  trackerMarker.setStyle({
-    color: breached ? '#ff0033' : '#3ddc84',
-    fillColor: breached ? '#ff0033' : '#3ddc84'
-  });
-}
-
-// A point guaranteed to sit inside the current geofence — used for
-// the Simulate button's "safe" state. turf.pointOnFeature (not centroid!)
-// guarantees the point actually lands inside, even for oddly-shaped polygons.
-function getInsideGeofencePoint() {
-  if (!geofencePolygon) return turf.point([SAFE_ZONE_CENTER_LNG, SAFE_ZONE_CENTER_LAT]);
-  return turf.pointOnFeature(geofencePolygon);
-}
-
-// A point well outside the current geofence — used for the Simulate
-// button's "breach" state. Projects outward from an inside point by a
-// fixed real-world distance in a random direction.
-function getOutsideGeofencePoint() {
-  const insidePoint = getInsideGeofencePoint();
-  const bearing      = Math.random() * 360;   // random compass direction
-  const distanceKm   = 0.6;                   // far enough to clear most drawn shapes
-  return turf.destination(insidePoint, distanceKm, bearing, { units: 'kilometers' });
-}
-
-window.addEventListener('load', initGeofenceMap);
-
-// ============================================
-//  LIVE HARDWARE FEED (Socket.io — real-time push)
-//  Your backend already broadcasts a "trackerUpdate" event the
-//  instant it receives new data from the ESP32 (see tracker.js).
-//  This connects to that instead of polling on a timer — updates
-//  arrive the moment they happen, with zero unnecessary requests.
-// ============================================
-
-let socket = null;
-let previousBreachState = false;
-
-// Shows/hides the "can't reach backend" banner in the sim card
-function showConnectionAlert(show) {
-  const alertEl = document.getElementById('connectionAlert');
-  if (alertEl) alertEl.style.display = show ? 'block' : 'none';
-}
-
-// Takes one reading ({latitude, longitude, timestamp}) and updates
-// every part of the dashboard to match it
-function applyLiveReading(data) {
-  if (!data || data.latitude === null || data.latitude === undefined) return;
-
-  const lat = Number(data.latitude);
-  const lng = Number(data.longitude);
-
-  // Real breach calculation — checked against YOUR drawn/edited polygon
-  // via Turf.js, instead of just trusting whatever the hardware sent
-  const breached = !isPointInsideGeofence(lat, lng);
-
-  updateTrackerMarker(lat, lng, breached);
-
-  const timeStamp = data.timestamp ? new Date(data.timestamp) : new Date();
-  const timeStr   = formatTime(timeStamp);
-  const latStr    = lat.toFixed(6);
-  const lngStr    = lng.toFixed(6);
-
-  if (coordValueEl) coordValueEl.textContent = `${latStr}, ${lngStr}`;
-  if (timeValueEl) timeValueEl.textContent  = timeStr;
-
-  const simCard    = document.getElementById('simCard');
-  const statusText = document.getElementById('statusText');
-
-  if (breached) {
-    if (simCard) simCard.classList.add('breached');
-    if (statusText) statusText.textContent = 'Safe Zone Breached!';
-    if (popupCoordTimeEl) popupCoordTimeEl.textContent = `📍 ${latStr}, ${lngStr}  •  🕒 ${timeStr}`;
-
-    if (!previousBreachState) {
-      showBreachNotification();
-    }
-  } else {
-    if (simCard) simCard.classList.remove('breached');
-    if (statusText) statusText.textContent = 'Inside Safe Zone';
-  }
-
-  previousBreachState = breached;
-}
-
-function startLiveFeed() {
-  showConnectionAlert(false);
-
-  socket = io(BACKEND_URL, { transports: ['websocket', 'polling'] });
-
-  socket.on('connect', function () {
-    console.log('Connected to backend:', BACKEND_URL);
-    showConnectionAlert(false);
-  });
-
-  // Fires the instant the backend receives new data from the ESP32
-  socket.on('trackerUpdate', function (data) {
-    applyLiveReading(data);
-  });
-
-  socket.on('connect_error', function (err) {
-    console.error('Could not connect to the backend server:', err);
-    showConnectionAlert(true);
-  });
-
-  socket.on('disconnect', function () {
-    showConnectionAlert(true);
-  });
-
-  // Also grab whatever reading is already saved, in case it arrived
-  // before this page connected (Socket.io only pushes NEW events)
-  fetch(`${BACKEND_URL}/api/tracker`)
-    .then(res => res.json())
-    .then(data => applyLiveReading(data))
-    .catch(err => {
-      console.log('No existing reading yet, or backend unreachable on first load.', err);
-      showConnectionAlert(true);
-    });
-}
-
-function stopLiveFeed() {
-  if (socket) {
-    socket.disconnect();
-    socket = null;
-  }
-  showConnectionAlert(false);
-  clearBreachReadout();
-
-  const simCard    = document.getElementById('simCard');
-  const statusText = document.getElementById('statusText');
-
-  if (simCard) simCard.classList.remove('breached');
-  if (statusText) statusText.textContent = 'Inside Safe Zone';
-  previousBreachState = false;
-
-  // Put the marker back at a known-safe point, colored green again
-  const safePoint = getInsideGeofencePoint();
-  if (safePoint) {
-    const [lng, lat] = safePoint.geometry.coordinates;
-    updateTrackerMarker(lat, lng, false);
-  }
-}
-
-// Mode Switch Handler
-const modeToggle     = document.getElementById('modeToggle');
-const modeCurrentTag = document.getElementById('modeCurrentTag');
-const simToggleBtn   = document.getElementById('simToggleBtn');
-
-if (modeToggle) {
-  modeToggle.addEventListener('change', function () {
-    const isLive = modeToggle.checked;
-
-    if (simToggleBtn) simToggleBtn.disabled = isLive;
-
-    if (isLive) {
-      if (modeCurrentTag) {
-        modeCurrentTag.textContent = 'Live Mode';
-        modeCurrentTag.classList.add('is-live');
+function checkExistingSession() {
+  if (localStorage.getItem("userLoggedIn") === "true") {
+    setTimeout(() => {
+      const name = localStorage.getItem("userName");
+      const avatar = localStorage.getItem("userAvatar");
+      if (name && avatar) {
+        document.getElementById("userName").innerText = name;
+        document.getElementById("userAvatar").src = avatar;
+        document.getElementById("googleBtn").classList.add("hidden");
+        document.getElementById("userProfile").classList.remove("hidden");
       }
-      startLiveFeed();
-    } else {
-      if (modeCurrentTag) {
-        modeCurrentTag.textContent = 'Demo Mode';
-        modeCurrentTag.classList.remove('is-live');
-      }
-      stopLiveFeed();
-    }
-  });
+    }, 300);
+  }
 }
 
-// ============================================
-//  SIMULATION TOGGLE LOGIC (Demo Mode)
-// ============================================
+// --------------------------------------------------------------------------
+// 7. DASHBOARD SIMULATION BUTTON HANDLERS
+// --------------------------------------------------------------------------
+function simulateSafeLocation() {
+  // Move to coordinates inside the safe zone polygon
+  updateVehiclePosition(13.0827, 80.2707);
+}
 
-const simCard    = document.getElementById('simCard');
-const statusText = document.getElementById('statusText');
-let isBreached   = false;
-
-if (simToggleBtn) {
-  simToggleBtn.addEventListener('click', function () {
-    isBreached = !isBreached;
-
-    // Pick a real point — either inside or outside the CURRENT geofence
-    // (whatever you've drawn/edited on the map, or the default circle)
-    const targetPoint = isBreached ? getOutsideGeofencePoint() : getInsideGeofencePoint();
-    const [lng, lat]  = targetPoint.geometry.coordinates;
-
-    // The REAL check — did that point actually land inside or outside?
-    const actuallyBreached = !isPointInsideGeofence(lat, lng);
-
-    updateTrackerMarker(lat, lng, actuallyBreached);
-
-    if (actuallyBreached) {
-      if (simCard) simCard.classList.add('breached');
-      if (statusText) statusText.textContent = 'Safe Zone Breached!';
-      simToggleBtn.textContent = 'Reset to Safe Zone';
-
-      showReadoutFromPoint(lat, lng);
-      showBreachNotification();
-    } else {
-      if (simCard) simCard.classList.remove('breached');
-      if (statusText) statusText.textContent = 'Inside Safe Zone';
-      simToggleBtn.textContent = 'Simulate Geofence Breach';
-
-      clearBreachReadout();
-    }
-  });
+function simulateBreachLocation() {
+  // Move to coordinates well outside the safe zone polygon
+  updateVehiclePosition(13.1100, 80.3000);
 }
