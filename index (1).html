@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Transit Guard — GPS Tracker &amp; Safe Zone App</title>
+
+<!-- Favicon — a small dashed-ring + red dot matching the header logo mark -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='40' fill='%230b0b0b' stroke='%23f2f2f0' stroke-width='6' stroke-dasharray='10 8'/%3E%3Ccircle cx='50' cy='50' r='14' fill='%23ff0033'/%3E%3C/svg%3E">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+<!-- Socket.io client — connects to the Node.js backend for real-time LIVE hardware updates -->
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+<!-- Leaflet — the interactive map itself -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- Leaflet.draw — lets you draw and drag-edit the geofence polygon on the map -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+<!-- Turf.js — the point-in-polygon math used for real breach detection -->
+<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
+<link rel="stylesheet" href="styles.css">
+
+<!-- Small overrides so Leaflet's default light-UI controls match our dark theme.
+     Kept here instead of styles.css so the map's styling stays together in one place. -->
+<style>
+  .leaflet-control-zoom a,
+  .leaflet-bar a{
+    background:#131313 !important;
+    color:#f2f2f0 !important;
+    border-color:#2a2a2a !important;
+  }
+  .leaflet-control-zoom a:hover{ background:#1c1c1c !important; }
+  .leaflet-draw-toolbar a{ background-color:#131313 !important; }
+  .leaflet-control-attribution{
+    background:rgba(10,10,10,0.75) !important;
+    color:#8a8a88 !important;
+    font-size:10px !important;
+  }
+  .leaflet-control-attribution a{ color:#bbb !important; }
+  #geofenceMap{ height:260px !important; }
+  .map-hint{
+    font-family:'JetBrains Mono', monospace;
+    font-size:11px;
+    color:#8a8a88;
+    margin: -12px 0 18px;
+    text-align:center;
+  }
+</style>
+</head>
+<body>
+
+  <!-- ================= HEADER ================= -->
+  <header>
+    <div class="wrapper header-inner">
+      <div class="logo-group">
+        <div class="logo-mark"><span></span></div>
+        <div class="logo-text">
+          SMART TRANSIT GUARD
+          <small>Robotics Exhibition Project</small>
+        </div>
+      </div>
+      <span class="header-badge">Class 9 Robotics Exhibition</span>
+    </div>
+
+    <!-- Tab bar: click a tab to switch the visible panel below -->
+    <div class="tabbar-row">
+      <div class="wrapper tabbar" id="tabbar">
+        <button class="tab-btn active" data-tab="main">Main</button>
+        <button class="tab-btn" data-tab="how-it-works">How It Works</button>
+        <button class="tab-btn" data-tab="features">Features</button>
+        <button class="tab-btn" data-tab="team">Team</button>
+        <button class="tab-btn" data-tab="feedback">Feedback</button>
+        <span class="tab-indicator" id="tabIndicator"></span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ================= MAIN TAB ================= -->
+  <section class="tab-panel active visible" id="panel-main">
+    <div class="wrapper hero-grid">
+
+      <div>
+        <span class="label-tag">GPS Tracker / Safe Zone System</span>
+        <h1 class="hero-title">Know exactly<br>where it is. <span class="accent">Instantly.</span></h1>
+        <p class="hero-desc">
+          Smart Transit Guard is a low-cost GPS tracking system that watches over school
+          transport in real time. Set a safe zone on the map — the moment the vehicle
+          leaves it, parents and admins get an instant alert.
+        </p>
+        <button class="btn btn-primary" id="seeHowItWorksBtn">See how it works</button>
+      </div>
+
+      <div class="sim-card" id="simCard">
+        <div class="sim-card-header">
+          <span class="label-tag">Live Simulation</span>
+          <div class="status-badge" id="statusBadge">
+            <span class="dot"></span>
+            <span id="statusText">Inside Safe Zone</span>
+          </div>
+        </div>
+
+        <div id="geofenceMap" class="sim-map"></div>
+        <p class="map-hint">Draw a polygon (top-left tool) or drag its corners to set a custom Safe Zone</p>
+
+        <!-- Live / Demo mode switch -->
+        <div class="mode-switch-row">
+          <span class="mode-switch-label">
+            <label class="switch">
+              <input type="checkbox" id="modeToggle">
+              <span class="slider"></span>
+            </label>
+            Live Hardware Feed
+          </span>
+          <span class="mode-current-tag" id="modeCurrentTag">Demo Mode</span>
+        </div>
+
+        <!-- Shown only if Live Mode can't reach the backend server -->
+        <div class="connection-alert" id="connectionAlert" style="display:none;">
+          ⚠ Could not reach the live backend. Check your connection, or switch back to Demo Mode.
+        </div>
+
+        <!-- Live coordinate + exact time readout -->
+        <div class="sim-readout">
+          <div class="readout-box">
+            <div class="readout-label">Last Known Coordinates</div>
+            <div class="readout-value" id="coordValue">— , —</div>
+          </div>
+          <div class="readout-box">
+            <div class="readout-label">Time Recorded</div>
+            <div class="readout-value" id="timeValue">--:--:--</div>
+          </div>
+        </div>
+
+        <button class="btn btn-primary sim-toggle-btn" id="simToggleBtn">Simulate Geofence Breach</button>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ================= HOW IT WORKS TAB ================= -->
+  <section class="tab-panel" id="panel-how-it-works">
+    <div class="wrapper">
+
+      <div class="section-head">
+        <span class="label-tag">The System</span>
+        <h2>Three parts, working as one.</h2>
+        <p>Every alert starts as raw location data and ends as a message on a parent's
+          phone. Here's how it moves through the system, step by step.</p>
+      </div>
+
+      <div class="pillars-grid">
+
+        <div class="pillar-card">
+          <span class="pillar-num">Step 01</span>
+          <div class="pillar-icon">📡</div>
+          <h3>Satellite Acquisition</h3>
+          <p><strong>The Tracker.</strong> The wearable tracker uses a Neo-6M GPS module
+            to communicate with overhead satellites, determining the user's precise
+            latitude and longitude coordinates.</p>
+        </div>
+
+        <div class="pillar-card">
+          <span class="pillar-num">Step 02</span>
+          <div class="pillar-icon">☁️</div>
+          <h3>Cloud Syncing</h3>
+          <p><strong>The Data Bridge.</strong> The onboard ESP32 microcontroller packages
+            these coordinates and uses Wi-Fi to continuously stream the live data to
+            our Node.js backend server, hosted on Render.</p>
+        </div>
+
+        <div class="pillar-card">
+          <span class="pillar-num">Step 03</span>
+          <div class="pillar-icon">💻</div>
+          <h3>Geofence Verification</h3>
+          <p><strong>The Website.</strong> This live tracking website pulls the
+            coordinates straight from the database in real time. It continuously
+            calculates the physical distance between the tracker and the center of
+            your pre-set "Safe Zone" to detect breaches.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= FEATURES TAB ================= -->
+  <section class="tab-panel" id="panel-features">
+    <div class="wrapper">
+
+      <div class="section-head">
+        <span class="label-tag">Capabilities</span>
+        <h2>Core Features</h2>
+        <p>Built to be simple for parents and reliable for the people responsible for
+          getting kids home safely.</p>
+      </div>
+
+      <div class="features-list">
+
+        <div class="feature-row">
+          <span class="feature-index">01</span>
+          <span class="feature-name">Real-Time GPS Tracking</span>
+          <span class="feature-desc">Delivers precise, active coordinate updates with
+            minimal latency.</span>
+        </div>
+
+        <div class="feature-row">
+          <span class="feature-index">02</span>
+          <span class="feature-name">Dynamic Geofencing</span>
+          <span class="feature-desc">Allows supervisors to establish a virtual boundary
+            around any location (like a school or home) with a customizable safety
+            radius.</span>
+        </div>
+
+        <div class="feature-row">
+          <span class="feature-index">03</span>
+          <span class="feature-name">Instant Safety Alerts <span class="tag">Priority</span></span>
+          <span class="feature-desc">Triggers immediate browser and system-level
+            notifications the exact second a boundary is crossed.</span>
+        </div>
+
+        <div class="feature-row">
+          <span class="feature-index">04</span>
+          <span class="feature-name">Low-Power Wearable Architecture</span>
+          <span class="feature-desc">Built on highly energy-efficient hardware, making
+            the tracker compact and easy to carry.</span>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= TEAM TAB ================= -->
+  <section class="tab-panel" id="panel-team">
+    <div class="wrapper">
+
+      <div class="section-head">
+        <span class="label-tag">Credits</span>
+        <h2>Project Members</h2>
+        <p>Class 9 — built for the robotics exhibition.</p>
+      </div>
+
+      <div class="members-grid">
+
+        <div class="member-card">
+          <div class="member-avatar">S</div>
+          <div class="member-name">Sanjiv</div>
+          <div class="member-role">Hardware Integration &amp; Cloud Systems</div>
+          <p class="member-contribution">Assembled the ESP32 microcontroller and Neo-6M
+            GPS circuitry, configured the power supply, and established the live data
+            pipeline to our Node.js backend, deployed on Render.</p>
+        </div>
+
+        <div class="member-card">
+          <div class="member-avatar">A</div>
+          <div class="member-name">Aashish Krishna</div>
+          <div class="member-role">Web &amp; UI Development</div>
+          <p class="member-contribution">Designed and coded the live tracking
+            website's interface, integrated the map coordinates system, and built
+            the geofence breach simulation and alert system.</p>
+        </div>
+
+        <div class="member-card">
+          <div class="member-avatar">P</div>
+          <div class="member-name">Prashanth Manoj Kumar</div>
+          <div class="member-role">System Architecture &amp; Quality Assurance</div>
+          <p class="member-contribution">Engineered full system calibration, designed test protocols for network drop recovery, and optimized power consumption for long-battery life operations.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= FEEDBACK TAB ================= -->
+  <section class="tab-panel" id="panel-feedback">
+    <div class="wrapper">
+
+      <div class="section-head">
+        <span class="label-tag">Reviews</span>
+        <h2>Exhibition Feedback</h2>
+        <p>We value your thoughts! Please let us know what you think about Smart Transit Guard.</p>
+      </div>
+
+      <div class="feedback-container">
+        <iframe 
+          src="https://forms.gle/Qun59Cid7N6YGux28" 
+          width="100%" 
+          height="800" 
+          frameborder="0" 
+          marginheight="0" 
+          marginwidth="0">
+          Loading feedback form…
+        </iframe>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ================= FOOTER ================= -->
+  <footer>
+    <div class="wrapper footer-inner">
+      <p>SMART TRANSIT GUARD — Robotics Exhibition Project</p>
+      <p>Built with HTML, CSS &amp; JavaScript</p>
+    </div>
+  </footer>
+
+  <!-- Simulated desktop notification -->
+  <div class="fake-notification" id="fakeNotification">
+    <span class="icon">🚨</span>
+    <div class="text-content">
+      <div class="title">SECURITY ALERT</div>
+      <div class="body">Tracker has left the designated Safe Zone.</div>
+      <div class="body" id="popupCoordTime" style="margin-top:6px; font-family: var(--font-mono); font-size:12px;"></div>
+    </div>
+  </div>
+
+<script src="script.js"></script>
+
+</body>
+</html>
